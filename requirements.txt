@@ -1,4 +1,12 @@
+# Core
 streamlit>=1.28.0
 PyMuPDF>=1.23.0
+
+# Audio (versiones compatibles con cloud)
 gtts>=2.3.0
-pygame>=2.5.0
+# Eliminar pygame - no funciona en cloud
+# Usamos reproducción vía HTML5
+
+# Utilidades
+numpy>=1.24.0
+pillow>=10.0.0
