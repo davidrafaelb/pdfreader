@@ -6,11 +6,10 @@ import threading
 from queue import Queue, Empty
 import tempfile
 from gtts import gTTS
-import pygame
 import io
-import re
+import base64
 
-# Configuración inicial - ya no usamos PDF_NAME fijo
+# Configuración inicial
 st.set_page_config(layout="wide", page_title="PDF Audio Reader", page_icon="📖")
 
 # Inicializar session state
@@ -46,6 +45,8 @@ if 'pdf_name' not in st.session_state:
     st.session_state.pdf_name = None
 if 'total_pages' not in st.session_state:
     st.session_state.total_pages = 0
+if 'audio_placeholder' not in st.session_state:
+    st.session_state.audio_placeholder = None
 
 def extract_text_with_positions(pdf_path, page_num):
     """Extrae texto con sus posiciones en la página"""
@@ -80,101 +81,78 @@ def highlight_words_on_page(pdf_path, page_num, word_indices_to_highlight, words
     
     return img_data
 
-def text_to_speech_thread(text, speed, word_queue, stop_flag):
-    """Hilo de audio usando gTTS y pygame - VERSIÓN NORMAL"""
+def play_audio_word(word):
+    """Reproduce una palabra usando HTML5 Audio con base64"""
     try:
-        # Inicializar pygame mixer
-        pygame.mixer.init()
+        tts = gTTS(text=word, lang='en', slow=False)
+        fp = io.BytesIO()
+        tts.write_to_fp(fp)
+        fp.seek(0)
+        audio_bytes = fp.read()
+        audio_base64 = base64.b64encode(audio_bytes).decode()
         
-        # Ajustar velocidad - Mapear WPM a delay
-        base_delay = 60.0 / speed  # segundos por palabra
-        
-        # Dividir el texto en palabras
+        # Crear HTML con audio autoplay
+        audio_html = f'''
+            <audio autoplay style="display:none">
+                <source src="data:audio/mp3;base64,{audio_base64}" type="audio/mp3">
+            </audio>
+        '''
+        return audio_html
+    except Exception as e:
+        print(f"Error generando audio: {e}")
+        return None
+
+def text_to_speech_thread(text, speed, word_queue, stop_flag):
+    """Hilo de audio optimizado para Streamlit Cloud"""
+    try:
         words = text.split()
         
+        # Calcular delay basado en velocidad (WPM)
+        word_delay = 60.0 / speed  # segundos por palabra
+        
         for i, word in enumerate(words):
-            # Verificar si debemos detener
             if stop_flag[0]:
                 print("Audio stopped by user")
                 break
             
-            try:
-                # Crear audio para cada palabra
-                tts = gTTS(text=word, lang='en', slow=False)
-                
-                # Guardar en archivo temporal
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
-                    temp_filename = fp.name
-                    tts.save(temp_filename)
-                
-                # Reproducir el audio
-                pygame.mixer.music.load(temp_filename)
-                pygame.mixer.music.play()
-                
-                # Enviar índice a la cola
-                word_queue.put(i)
-                
-                # Calcular tiempo de espera basado en velocidad
-                audio_duration = len(word) * 0.05  # Estimación aproximada
-                wait_time = max(0.05, min(audio_duration, base_delay * 0.8))
-                
-                # Esperar a que termine o hasta que se cumpla el tiempo
-                start_time = time.time()
-                while pygame.mixer.music.get_busy():
-                    if stop_flag[0]:
-                        pygame.mixer.music.stop()
-                        break
-                    if time.time() - start_time > wait_time * 2:
-                        # Forzar siguiente palabra si se pasa del tiempo
-                        pygame.mixer.music.stop()
-                        break
-                    time.sleep(0.01)
-                
-                # Limpiar archivo temporal
-                try:
-                    os.unlink(temp_filename)
-                except:
-                    pass
-                    
-            except Exception as e:
-                print(f"Error procesando palabra '{word}': {e}")
-                # Aún así enviar el índice para mantener el ritmo
-                word_queue.put(i)
-                time.sleep(base_delay * 0.5)
-                continue
+            # Enviar índice a la cola
+            word_queue.put(i)
+            
+            # Generar y reproducir audio
+            audio_html = play_audio_word(word)
+            if audio_html:
+                word_queue.put(f"AUDIO:{i}:{audio_html}")
+            
+            # Esperar según velocidad
+            time.sleep(word_delay * 0.8)  # 80% del tiempo para permitir solapamiento
         
-        # Señal de finalización
-        word_queue.put(-1)
+        word_queue.put(-1)  # Señal de finalización
         
     except Exception as e:
         print(f"Error en hilo de audio: {e}")
         word_queue.put(-1)
-    finally:
-        pygame.mixer.quit()
 
 def text_to_speech_thread_fast(text, speed, word_queue, stop_flag):
-    """VERSIÓN ULTRA RÁPIDA - Agrupa palabras para reducir llamadas a gTTS"""
+    """Versión rápida para Streamlit Cloud"""
     try:
-        pygame.mixer.init()
+        words = text.split()
         
         # Determinar tamaño de chunk basado en velocidad
         if speed >= 500:
-            chunk_size = 5  # 5 palabras por chunk
-            chunk_delay = 0.3
+            chunk_size = 5
+            chunk_delay = 0.25
         elif speed >= 400:
             chunk_size = 4
-            chunk_delay = 0.25
+            chunk_delay = 0.2
         elif speed >= 300:
             chunk_size = 3
-            chunk_delay = 0.2
+            chunk_delay = 0.15
         elif speed >= 200:
             chunk_size = 2
-            chunk_delay = 0.15
+            chunk_delay = 0.1
         else:
             chunk_size = 1
-            chunk_delay = 0.1
-        
-        words = text.split()
+            chunk_delay = 0.08
         
         for i in range(0, len(words), chunk_size):
             if stop_flag[0]:
@@ -184,44 +162,22 @@ def text_to_speech_thread_fast(text, speed, word_queue, stop_flag):
             chunk_words = words[i:end_idx]
             chunk_text = ' '.join(chunk_words)
             
-            try:
-                # Crear audio para el chunk
-                tts = gTTS(text=chunk_text, lang='en', slow=False)
-                
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
-                    temp_filename = fp.name
-                    tts.save(temp_filename)
-                
-                pygame.mixer.music.load(temp_filename)
-                pygame.mixer.music.play()
-                
-                # Enviar índices de todas las palabras del chunk
-                for j in range(i, end_idx):
-                    word_queue.put(j)
-                
-                # Esperar el tiempo adecuado
-                time.sleep(chunk_delay)
-                
-                # Limpiar
-                try:
-                    os.unlink(temp_filename)
-                except:
-                    pass
-                    
-            except Exception as e:
-                print(f"Error procesando chunk: {e}")
-                # Enviar índices de todas formas
-                for j in range(i, end_idx):
-                    word_queue.put(j)
-                time.sleep(chunk_delay)
+            # Enviar índices de todas las palabras del chunk
+            for j in range(i, end_idx):
+                word_queue.put(j)
+            
+            # Generar audio para el chunk
+            audio_html = play_audio_word(chunk_text)
+            if audio_html:
+                word_queue.put(f"AUDIO:{i}:{audio_html}")
+            
+            time.sleep(chunk_delay)
         
         word_queue.put(-1)
         
     except Exception as e:
         print(f"Error: {e}")
         word_queue.put(-1)
-    finally:
-        pygame.mixer.quit()
 
 def load_pages(pdf_path, start_page, end_page):
     """Carga todas las páginas en el rango seleccionado"""
@@ -288,10 +244,8 @@ st.title("📖 PDF Audio Reader - Highlighting in PDF")
 # Sección de carga de PDF
 with st.container():
     st.subheader("📤 Load PDF")
-    col1, col2 = st.columns([3, 1])
     
-    with col1:
-        uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key="pdf_uploader")
+    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key="pdf_uploader")
     
     if uploaded_file is not None:
         # Guardar el archivo temporalmente
@@ -311,7 +265,7 @@ with st.container():
             # Obtener total de páginas
             doc = fitz.open(temp_path)
             st.session_state.total_pages = len(doc)
-            st.session_state.end_page = min(3, len(doc))  # Default a 3 páginas o menos
+            st.session_state.end_page = min(3, len(doc))
             doc.close()
             
             st.success(f"✅ Loaded: {uploaded_file.name}")
@@ -352,7 +306,7 @@ with st.sidebar:
     else:
         st.info(f"📖 Reading pages {st.session_state.start_page} to {st.session_state.end_page}")
     
-    # Slider de velocidad AMPLIADO hasta 800 WPM
+    # Slider de velocidad
     reading_speed = st.slider("Reading Speed (WPM)", 100, 800, 250, 50,
                              help="Words per minute (higher = faster). 250+ for fast reading",
                              disabled=st.session_state.is_reading)
@@ -373,10 +327,9 @@ with st.sidebar:
     st.markdown("""
     1. Upload a PDF file
     2. Select start and end pages
-    3. Adjust speed (250+ for fast reading)
-    4. Enable Ultra Fast for maximum speed
-    5. Click START to begin
-    6. Watch the PDF highlight in real-time
+    3. Adjust speed
+    4. Click START to begin
+    5. Watch the PDF highlight in real-time
     """)
 
 # Obtener páginas del estado
@@ -452,12 +405,15 @@ with col2:
             progress = (st.session_state.word_index / len(st.session_state.all_words_list)) * 100
             st.metric("Progress", f"{progress:.1f}%")
         
+        # Contenedor para audio
+        audio_container = st.empty()
+        
         # Botones de control
         col_btn1, col_btn2 = st.columns(2)
         
         with col_btn1:
             if not st.session_state.is_reading:
-                if st.button("▶️ START", type="primary", key="start_btn"):
+                if st.button("▶️ START", type="primary", key="start_btn", use_container_width=True):
                     # Limpiar cola
                     while not st.session_state.word_queue.empty():
                         try:
@@ -474,7 +430,7 @@ with col2:
                     # Crear referencia mutable para el hilo
                     stop_audio_ref = [st.session_state.stop_audio]
                     
-                    # Elegir versión según modo ultra rápido
+                    # Elegir versión según modo
                     if ultra_fast_mode:
                         thread_func = text_to_speech_thread_fast
                     else:
@@ -495,13 +451,13 @@ with col2:
         
         with col_btn2:
             if st.session_state.is_reading:
-                if st.button("⏹️ STOP", type="secondary", key="stop_btn"):
+                if st.button("⏹️ STOP", type="secondary", key="stop_btn", use_container_width=True):
                     # Activar bandera de stop
                     st.session_state.stop_audio = True
                     if 'stop_audio_ref' in st.session_state:
                         st.session_state.stop_audio_ref[0] = True
                     
-                    # Esperar un momento para que el hilo termine
+                    # Esperar un momento
                     time.sleep(0.5)
                     
                     st.session_state.is_reading = False
@@ -510,26 +466,33 @@ with col2:
         # Procesar cola de palabras
         if st.session_state.is_reading:
             try:
-                # Procesar todos los mensajes en la cola
                 messages_processed = 0
-                while not st.session_state.word_queue.empty() and messages_processed < 20:
-                    word_idx = st.session_state.word_queue.get_nowait()
+                while not st.session_state.word_queue.empty() and messages_processed < 30:
+                    message = st.session_state.word_queue.get_nowait()
                     messages_processed += 1
                     
-                    if word_idx == -1:  # Finalización
+                    if message == -1:  # Finalización
                         st.session_state.is_reading = False
                         st.balloons()
                         st.success("✅ Reading completed!")
                         st.rerun()
-                    elif word_idx >= 0 and word_idx < len(st.session_state.all_words_list):
-                        st.session_state.word_index = word_idx
-                        
-                        # Actualizar página actual
-                        for page_num, (start_idx, end_idx) in st.session_state.page_word_ranges.items():
-                            if start_idx <= word_idx < end_idx:
-                                if st.session_state.current_page != page_num:
-                                    st.session_state.current_page = page_num
-                                break
+                    elif isinstance(message, int):  # Índice de palabra
+                        word_idx = message
+                        if word_idx < len(st.session_state.all_words_list):
+                            st.session_state.word_index = word_idx
+                            
+                            # Actualizar página
+                            for page_num, (start_idx, end_idx) in st.session_state.page_word_ranges.items():
+                                if start_idx <= word_idx < end_idx:
+                                    if st.session_state.current_page != page_num:
+                                        st.session_state.current_page = page_num
+                                    break
+                    elif isinstance(message, str) and message.startswith("AUDIO:"):
+                        # Mensaje de audio
+                        parts = message.split(":", 2)
+                        if len(parts) == 3:
+                            audio_html = parts[2]
+                            audio_container.markdown(audio_html, unsafe_allow_html=True)
             except Empty:
                 pass
         
@@ -543,7 +506,6 @@ with col2:
                 current_word = st.session_state.all_words_list[st.session_state.word_index][4]
                 st.markdown("### 📢 Now reading:")
                 
-                # Contenedor con estilo para la palabra actual
                 st.markdown(f"""
                 <div style='
                     text-align: center;
@@ -563,6 +525,7 @@ with col2:
 
 # ===== MOSTRAR PDF CON RESALTADOS =====
 current_display_page = st.session_state.current_page
+words_by_page = st.session_state.words_by_page
 
 if current_display_page in words_by_page:
     if st.session_state.is_reading:
@@ -584,7 +547,7 @@ if current_display_page in words_by_page:
                 pdf_placeholder.image(highlighted_img, use_container_width=True)
             except Exception as e:
                 st.error(f"Error highlighting: {e}")
-                # Fallback: mostrar PDF sin resaltar
+                # Fallback
                 doc = fitz.open(pdf_path)
                 page = doc[current_display_page - 1]
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
@@ -613,7 +576,7 @@ if st.session_state.is_reading:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: gray; padding: 10px;'>
-    PDF Audio Reader - Upload any PDF!<br>
-    Made with Streamlit
+    PDF Audio Reader - Optimized for Streamlit Cloud<br>
+    Made with ❤️ using gTTS + HTML5 Audio
 </div>
 """, unsafe_allow_html=True)
